@@ -143,6 +143,20 @@ fn run() -> windows_core::Result<()> {
     }
     report("Error", start);
 
+    // Variant of `Error`: instead of merely checking a returned `Result::Err` (a bare
+    // HRESULT, no origination), this constructs an *originating* error each iteration.
+    // `Error::new` with a non-empty message calls `RoOriginateErrorW`, which builds an
+    // `IRestrictedErrorInfo` and sets it on the thread, then captures it back -- the
+    // windows-rs equivalent of the origination cppwinrt performs automatically at every
+    // throw boundary. This isolates windows-rs origination cost with no ABI crossing and
+    // no C++ exception throw/unwind, so it is comparable to the origination *component* of
+    // the C++/WinRT `Error` cost (see the Rust->C++ vs Rust->Rust delta).
+    let start = Instant::now();
+    for _ in 0..iterations {
+        std::hint::black_box(Error::new(HRESULT(0x8000_000B_u32 as i32), "value"));
+    }
+    report("ErrorOriginate", start);
+
     Ok(())
 }
 

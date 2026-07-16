@@ -1,0 +1,2 @@
+# Build output from msvc/build.ps1 (pure-MSVC C++ build) and the symbol/disasm build.
+out/

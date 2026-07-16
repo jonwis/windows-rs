@@ -8,6 +8,7 @@ members = [
 ]
 exclude = [
     "crates/targets/baseline",
+    "crates/samples/lang_perf/msvc",
 ]
 
 [profile.release]
