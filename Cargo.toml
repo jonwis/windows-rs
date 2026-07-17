@@ -9,6 +9,7 @@ members = [
 exclude = [
     "crates/targets/baseline",
     "crates/samples/lang_perf/msvc",
+    "crates/samples/lang_perf/cppwinrt-new",
 ]
 
 [profile.release]
