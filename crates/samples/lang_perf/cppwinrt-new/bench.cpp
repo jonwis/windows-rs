@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include "winrt/LangPerf.h"
 #include "winrt/Windows.Foundation.h"
@@ -17,74 +18,76 @@ static long long elapsed_ms(std::chrono::high_resolution_clock::time_point const
         .count();
 }
 
+// Run `body` for `warmup` untimed iterations -- bringing the CPU to steady turbo frequency and
+// warming this loop's caches and branch predictors -- then time `iterations` measured iterations.
+// The warmup count comes from LANG_PERF_WARMUP so the exported entry point keeps its signature.
+// The lambda is inlined (F&&), so the timed loop is as tight as a hand-written for-loop.
+template <typename F>
+static void measure(char const* label, uint64_t warmup, uint64_t iterations, F&& body)
+{
+    for (uint64_t i = 0; i < warmup; i++) body();
+    auto const start = std::chrono::high_resolution_clock::now();
+    for (uint64_t i = 0; i < iterations; i++) body();
+    printf("%s: %lld ms\n", label, elapsed_ms(start));
+}
+
 extern "C" int32_t __stdcall lang_perf_cpp(uint64_t iterations) noexcept
 {
     try
     {
+        uint64_t warmup = 0;
+        if (char const* w = std::getenv("LANG_PERF_WARMUP"))
+        {
+            warmup = std::strtoull(w, nullptr, 10);
+        }
+
         init_apartment();
         Class object;
-        printf("# C++ consumer -> %ls component - %llu iterations\n",
-               object.Lang().c_str(), static_cast<unsigned long long>(iterations));
+        printf("# C++ consumer -> %ls component - %llu iterations (%llu warmup)\n",
+               object.Lang().c_str(),
+               static_cast<unsigned long long>(iterations),
+               static_cast<unsigned long long>(warmup));
 
-        auto start = std::chrono::high_resolution_clock::now();
-        for (uint64_t i = 0; i < iterations; i++)
-        {
+        measure("Create", warmup, iterations, [&] {
             Class temp;
             (void)temp;
-        }
-        printf("Create: %lld ms\n", elapsed_ms(start));
+        });
 
-        start = std::chrono::high_resolution_clock::now();
-        for (uint64_t i = 0; i < iterations; i++)
-        {
+        measure("Int32", warmup, iterations, [&] {
             object.Int32Property(123);
             auto value = object.Int32Property();
             (void)value;
-        }
-        printf("Int32: %lld ms\n", elapsed_ms(start));
+        });
 
-        start = std::chrono::high_resolution_clock::now();
-        for (uint64_t i = 0; i < iterations; i++)
-        {
+        measure("String", warmup, iterations, [&] {
             object.StringProperty(L"value"_hs);
             auto value = object.StringProperty();
             (void)value;
-        }
-        printf("String: %lld ms\n", elapsed_ms(start));
+        });
 
-        start = std::chrono::high_resolution_clock::now();
-        for (uint64_t i = 0; i < iterations; i++)
-        {
+        measure("Object", warmup, iterations, [&] {
             object.ObjectProperty(object);
             auto value = object.ObjectProperty();
             (void)value;
-        }
-        printf("Object: %lld ms\n", elapsed_ms(start));
+        });
 
-        start = std::chrono::high_resolution_clock::now();
-        for (uint64_t i = 0; i < iterations; i++)
-        {
+        measure("Cast", warmup, iterations, [&] {
             auto value = object.ObjectProperty().as<INonDefault>().Value();
             (void)value;
-        }
-        printf("Cast: %lld ms\n", elapsed_ms(start));
+        });
 
-        auto token = object.Event([](Windows::Foundation::IInspectable const&, int32_t) {});
-        start = std::chrono::high_resolution_clock::now();
-        for (uint64_t i = 0; i < iterations; i++)
         {
-            object.Raise();
+            auto token = object.Event([](Windows::Foundation::IInspectable const&, int32_t) {});
+            measure("Event", warmup, iterations, [&] {
+                object.Raise();
+            });
+            object.Event(token);
         }
-        printf("Event: %lld ms\n", elapsed_ms(start));
-        object.Event(token);
 
-        start = std::chrono::high_resolution_clock::now();
-        for (uint64_t i = 0; i < iterations; i++)
-        {
+        measure("AddRemove", warmup, iterations, [&] {
             auto added = object.Event([](Windows::Foundation::IInspectable const&, int32_t) {});
             object.Event(added);
-        }
-        printf("AddRemove: %lld ms\n", elapsed_ms(start));
+        });
 
         {
             uint32_t const count = iterations > UINT32_MAX
@@ -92,53 +95,49 @@ extern "C" int32_t __stdcall lang_perf_cpp(uint64_t iterations) noexcept
                 : static_cast<uint32_t>(iterations);
             auto vector = object.Items(count);
 
-            start = std::chrono::high_resolution_clock::now();
-            int32_t sum = 0;
-            for (auto&& value : vector)
-            {
-                sum += value;
-            }
-            volatile int32_t sink = sum;
-            (void)sink;
+            auto iterate = [&] {
+                int32_t sum = 0;
+                for (auto&& value : vector) sum += value;
+                volatile int32_t sink = sum;
+                (void)sink;
+            };
+            if (warmup) iterate();
+            auto start = std::chrono::high_resolution_clock::now();
+            iterate();
             printf("IterateVector: %lld ms\n", elapsed_ms(start));
 
             std::vector<int32_t> buffer(count);
+            auto getmany = [&] { vector.GetMany(0, buffer); };
+            if (warmup) getmany();
             start = std::chrono::high_resolution_clock::now();
-            vector.GetMany(0, buffer);
+            getmany();
             printf("GetMany: %lld ms\n", elapsed_ms(start));
 
             auto map = object.Map(count);
+            auto iterate_map = [&] {
+                int32_t msum = 0;
+                for (auto&& pair : map) msum += pair.Value();
+                volatile int32_t msink = msum;
+                (void)msink;
+            };
+            if (warmup) iterate_map();
             start = std::chrono::high_resolution_clock::now();
-            int32_t msum = 0;
-            for (auto&& pair : map)
-            {
-                msum += pair.Value();
-            }
-            volatile int32_t msink = msum;
-            (void)msink;
+            iterate_map();
             printf("Map: %lld ms\n", elapsed_ms(start));
         }
 
-        start = std::chrono::high_resolution_clock::now();
-        for (uint64_t i = 0; i < iterations; i++)
-        {
+        measure("Async", warmup, iterations, [&] {
             auto value = object.Operation().get();
             (void)value;
-        }
-        printf("Async: %lld ms\n", elapsed_ms(start));
+        });
 
-        start = std::chrono::high_resolution_clock::now();
-        for (uint64_t i = 0; i < iterations; i++)
-        {
+        measure("Reference", warmup, iterations, [&] {
             object.ReferenceProperty(0);
             auto value = object.ReferenceProperty().Value();
             (void)value;
-        }
-        printf("Reference: %lld ms\n", elapsed_ms(start));
+        });
 
-        start = std::chrono::high_resolution_clock::now();
-        for (uint64_t i = 0; i < iterations; i++)
-        {
+        measure("Error", warmup, iterations, [&] {
             try
             {
                 (void)object.Next();
@@ -146,8 +145,7 @@ extern "C" int32_t __stdcall lang_perf_cpp(uint64_t iterations) noexcept
             catch (hresult_error const&)
             {
             }
-        }
-        printf("Error: %lld ms\n", elapsed_ms(start));
+        });
 
         fflush(stdout);
         return 0;

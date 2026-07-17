@@ -35,127 +35,152 @@ fn main() {
 
 fn run() -> windows_core::Result<()> {
     use bindings::*;
-    use std::time::Instant;
     use windows_core::*;
+
+    // Run `body` for `warmup` untimed iterations -- reaching steady CPU frequency and warming this
+    // loop's caches/predictors -- then time `iterations`. Generic, so the body is monomorphized and
+    // the timed loop stays as tight as an inline for-loop.
+    fn measure<F: FnMut() -> windows_core::Result<()>>(
+        label: &str,
+        warmup: u64,
+        iterations: u64,
+        mut body: F,
+    ) -> windows_core::Result<()> {
+        for _ in 0..warmup {
+            body()?;
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            body()?;
+        }
+        report(label, start);
+        Ok(())
+    }
 
     stage_component(component_file());
 
     let iterations = iterations();
+    let warmup: u64 = std::env::var("LANG_PERF_WARMUP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let object = Class::new()?;
     println!(
-        "# Rust consumer -> {} component - {iterations} iterations",
+        "# Rust consumer -> {} component - {iterations} iterations ({warmup} warmup)",
         object.Lang()?.to_string_lossy()
     );
 
-    let start = Instant::now();
-    for _ in 0..iterations {
+    measure("Create", warmup, iterations, || {
         let _ = Class::new()?;
-    }
-    report("Create", start);
+        Ok(())
+    })?;
 
-    let start = Instant::now();
-    for _ in 0..iterations {
+    measure("Int32", warmup, iterations, || {
         object.SetInt32Property(123)?;
         let _ = object.Int32Property()?;
-    }
-    report("Int32", start);
+        Ok(())
+    })?;
 
-    let start = Instant::now();
-    for _ in 0..iterations {
+    measure("String", warmup, iterations, || {
         object.SetStringProperty(h!("value"))?;
         let _ = object.StringProperty()?;
-    }
-    report("String", start);
+        Ok(())
+    })?;
 
-    let start = Instant::now();
-    for _ in 0..iterations {
+    measure("Object", warmup, iterations, || {
         object.SetObjectProperty(&object)?;
         let _ = object.ObjectProperty()?;
-    }
-    report("Object", start);
+        Ok(())
+    })?;
 
-    let start = Instant::now();
-    for _ in 0..iterations {
+    measure("Cast", warmup, iterations, || {
         let _ = object.ObjectProperty()?.cast::<INonDefault>()?.Value()?;
-    }
-    report("Cast", start);
+        Ok(())
+    })?;
 
     {
         let _revoker = object.Event(|_sender, _value| {})?;
-        let start = Instant::now();
-        for _ in 0..iterations {
+        measure("Event", warmup, iterations, || {
             object.Raise()?;
-        }
-        report("Event", start);
+            Ok(())
+        })?;
     }
 
-    let start = Instant::now();
-    for _ in 0..iterations {
+    measure("AddRemove", warmup, iterations, || {
         let _revoker = object.Event(|_sender, _value| {})?;
-    }
-    report("AddRemove", start);
+        Ok(())
+    })?;
 
     {
         let count = iterations.min(u32::MAX as u64) as u32;
         let vector = object.Items(count)?;
 
-        let start = Instant::now();
-        let mut sum = 0i32;
-        for value in &vector {
-            sum = sum.wrapping_add(value);
+        let iterate = || {
+            let mut sum = 0i32;
+            for value in &vector {
+                sum = sum.wrapping_add(value);
+            }
+            std::hint::black_box(sum);
+        };
+        if warmup > 0 {
+            iterate();
         }
-        std::hint::black_box(sum);
+        let start = std::time::Instant::now();
+        iterate();
         report("IterateVector", start);
 
         let mut buffer = vec![0i32; count as usize];
-        let start = Instant::now();
+        if warmup > 0 {
+            let _ = vector.GetMany(0, &mut buffer)?;
+        }
+        let start = std::time::Instant::now();
         let _ = vector.GetMany(0, &mut buffer)?;
         std::hint::black_box(&buffer);
         report("GetMany", start);
 
         let map = object.Map(count)?;
-        let start = Instant::now();
-        let mut sum = 0i32;
-        for pair in &map {
-            sum = sum.wrapping_add(pair.Value()?);
+        let iterate_map = || -> windows_core::Result<()> {
+            let mut sum = 0i32;
+            for pair in &map {
+                sum = sum.wrapping_add(pair.Value()?);
+            }
+            std::hint::black_box(sum);
+            Ok(())
+        };
+        if warmup > 0 {
+            iterate_map()?;
         }
-        std::hint::black_box(sum);
+        let start = std::time::Instant::now();
+        iterate_map()?;
         report("Map", start);
     }
 
-    let start = Instant::now();
-    for _ in 0..iterations {
+    measure("Async", warmup, iterations, || {
         let _ = object.Operation()?.join()?;
-    }
-    report("Async", start);
+        Ok(())
+    })?;
 
-    let start = Instant::now();
-    for _ in 0..iterations {
+    measure("Reference", warmup, iterations, || {
         object.SetReferenceProperty(Some(0))?;
         let _ = object.ReferenceProperty()?;
-    }
-    report("Reference", start);
+        Ok(())
+    })?;
 
-    let start = Instant::now();
-    for _ in 0..iterations {
+    measure("Error", warmup, iterations, || {
         let _ = object.Next();
-    }
-    report("Error", start);
+        Ok(())
+    })?;
 
-    // Variant of `Error`: instead of merely checking a returned `Result::Err` (a bare
-    // HRESULT, no origination), this constructs an *originating* error each iteration.
-    // `Error::new` with a non-empty message calls `RoOriginateErrorW`, which builds an
-    // `IRestrictedErrorInfo` and sets it on the thread, then captures it back -- the
-    // windows-rs equivalent of the origination cppwinrt performs automatically at every
-    // throw boundary. This isolates windows-rs origination cost with no ABI crossing and
-    // no C++ exception throw/unwind, so it is comparable to the origination *component* of
-    // the C++/WinRT `Error` cost (see the Rust->C++ vs Rust->Rust delta).
-    let start = Instant::now();
-    for _ in 0..iterations {
+    // Variant of `Error`: constructs an *originating* error each iteration. `Error::new` with a
+    // non-empty message calls `RoOriginateErrorW`, which builds an `IRestrictedErrorInfo` and sets
+    // it on the thread, then captures it back -- the windows-rs equivalent of the origination
+    // cppwinrt performs at every throw boundary. Isolates windows-rs origination cost with no ABI
+    // crossing and no C++ exception throw/unwind.
+    measure("ErrorOriginate", warmup, iterations, || {
         std::hint::black_box(Error::new(HRESULT(0x8000_000B_u32 as i32), "value"));
-    }
-    report("ErrorOriginate", start);
+        Ok(())
+    })?;
 
     Ok(())
 }
